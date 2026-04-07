@@ -1,0 +1,82 @@
+{
+    "sciencedirect.com": {
+        "pdf_meta_tag": "citation_pdf_url",
+        "button_xpath": "//a[contains(@class, 'pdf-download-btn')] | //button[contains(., 'Download PDF')]",
+        "timeout": 15
+    },
+    "nature.com": {
+        "pdf_meta_tag": "citation_pdf_url",
+        "button_xpath": "//a[@data-track-action='download pdf']",
+        "timeout": 15
+    },
+    "springer.com": {
+        "pdf_meta_tag": "citation_pdf_url",
+        "button_xpath": "//a[@data-track-action='Pdf download']",
+        "timeout": 15
+    },
+    "default": {
+        "pdf_meta_tag": "citation_pdf_url",
+        "button_xpath": "//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download pdf')]",
+        "timeout": 20
+    },
+    "dom-pubs.pericles-prod.literatumonline.com": {
+        "pdf_meta_tag": "citation_pdf_url",
+        "button_xpath": "//a[contains(@class, 'pdf-download') or @title='ePDF']",
+        "timeout": 15
+    },
+    "onlinelibrary.wiley.com": {
+        "pdf_meta_tag": "citation_pdf_url",
+        "button_xpath": "//a[contains(@class, 'pdf-download') or @title='ePDF']",
+        "timeout": 15
+    },
+    "tandfonline.com": {
+        "pdf_meta_tag": "citation_pdf_url",
+        "button_xpath": "//a[contains(@class, 'show-pdf') or contains(@title, 'PDF')]",
+        "timeout": 20
+    },
+    "ieeexplore.ieee.org": {
+        "pdf_meta_tag": "citation_pdf_url",
+        "button_xpath": "//a[contains(@class, 'pdf-btn-link') or contains(@href, 'stamp/stamp.jsp')]",
+        "timeout": 25
+    },
+    "dl.acm.org": {
+        "pdf_meta_tag": "citation_pdf_url",
+        "button_xpath": "//a[@title='PDF' or contains(@class, 'btn--pdf')]",
+        "timeout": 15
+    },
+    "ncbi.nlm.nih.gov": {
+        "pdf_meta_tag": "citation_pdf_url",
+        "button_xpath": "//a[contains(@class, 'int-view') or contains(@href, 'pdf') and contains(., 'PDF')]",
+        "timeout": 15
+    },
+    "academic.oup.com": {
+        "pdf_meta_tag": "citation_pdf_url",
+        "button_xpath": "//a[contains(@class, 'article-pdfLink') or contains(., 'PDF')]",
+        "timeout": 15
+    },
+    "mdpi.com": {
+        "pdf_meta_tag": "citation_pdf_url",
+        "button_xpath": "//a[contains(@href, '/pdf')]",
+        "timeout": 10
+    },
+    "journals.plos.org": {
+        "pdf_meta_tag": "citation_pdf_url",
+        "button_xpath": "//a[contains(@id, 'downloadPdf') or contains(@href, 'file?id=')]",
+        "timeout": 10
+    },
+    "ascopubs.org": {
+        "pdf_meta_tag": "citation_pdf_url",
+        "button_xpath": "//a[contains(@class, 'pdf-btn') or contains(@title, 'PDF')]",
+        "timeout": 15
+    },
+    "annalsofoncology.org": {
+        "pdf_meta_tag": "citation_pdf_url",
+        "button_xpath": "//a[contains(@class, 'pdf-download-btn')] | //button[contains(., 'Download PDF')]",
+        "timeout": 15
+    },
+    "esmoopen.com": {
+        "pdf_meta_tag": "citation_pdf_url",
+        "button_xpath": "//a[contains(@class, 'pdf-download-btn')] | //button[contains(., 'Download PDF')]",
+        "timeout": 15
+    }
+}
