@@ -1,10 +1,20 @@
-import concurrent.futures
 import queue
+import re
 import pandas as pd
 import json
 import os
 import sys
 import shutil
+import subprocess
+import time
+import random
+import base64
+import requests
+from urllib.parse import quote, urlparse
+from seleniumbase import Driver
+from thefuzz import fuzz
+from fpdf import FPDF
+import fitz  # PyMuPDF
 
 if os.name != 'nt':
     try:
@@ -14,593 +24,348 @@ if os.name != 'nt':
         if not os.path.exists(tmp_sb):
             shutil.copytree(orig_sb, tmp_sb)
             os.system(f"chmod -R 777 {tmp_sb}")
-        
         for k in list(sys.modules.keys()):
-            if k.startswith("seleniumbase"):
-                del sys.modules[k]
-        if "/tmp" not in sys.path:
-            sys.path.insert(0, "/tmp")
-            
-        # Start virtual display manually instead of passing xvfb=True to Driver()
+            if k.startswith("seleniumbase"): del sys.modules[k]
+        if "/tmp" not in sys.path: sys.path.insert(0, "/tmp")
         from pyvirtualdisplay import Display
-        vdisplay = Display(visible=0, size=(1280, 1024))
+        vdisplay = Display(visible=0, size=(1024, 768))
         vdisplay.start()
-    except Exception as e:
-        print("SB Hack failed:", e)
-import time
-import base64
-from urllib.parse import urlparse
-from seleniumbase import Driver
-from selenium.webdriver.common.by import By
-from thefuzz import fuzz
-from fpdf import FPDF
-import fitz  # PyMuPDF
+    except: pass
 
-# Keywords that strongly indicate a paywall page
-PAYWALL_KEYWORDS = [
-    "access this article", "purchase article", "buy article",
-    "subscribe to access", "institutional login", "sign in to access",
-    "full text access", "get access", "rent or buy",
-    "pay-per-view", "purchase access", "access options",
-    "subscribe or purchase", "paywall", "not have access",
-    "unlock the full article", "article purchase",
+BASE_PROFILE_DIR = os.path.join(os.path.expanduser('~'), '.scraper_profiles')
+EDGE_MASTER_PROFILE = os.path.join(BASE_PROFILE_DIR, 'master_profile')
+
+EDGE_ARGS = [
+    "--ignore-certificate-errors",
+    "--allow-running-insecure-content",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-popup-blocking",
+    "--disable-notifications",
+    "--disable-blink-features=AutomationControlled",
+    "--auth-server-whitelist='*'", 
+    "--disable-features=IsolateOrigins,site-per-process", 
 ]
 
+STEALTH_SCRIPT = """
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    window.navigator.chrome = { runtime: {} };
+    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+"""
+
+class HumanSimulator:
+    """Autonomous routines to spoof bot protections and clear overlays."""
+    @staticmethod
+    def human_delay(min_s=1.5, max_s=4.0):
+        time.sleep(random.uniform(min_s, max_s))
+
+    @staticmethod
+    def organic_scroll(driver):
+        try:
+            total_height = driver.execute_script("return document.body.scrollHeight")
+            viewport = driver.execute_script("return window.innerHeight")
+            if total_height <= viewport: return
+            current_pos = 0
+            while current_pos < (total_height * 0.6): 
+                step = random.randint(150, 400)
+                current_pos += step
+                driver.execute_script(f"window.scrollTo({{top: {current_pos}, behavior: 'smooth'}});")
+                HumanSimulator.human_delay(0.5, 1.2)
+        except: pass
+
+    @staticmethod
+    def annihilate_overlays(driver):
+        js_destroyer = """
+        try {
+            var keywords = ['accept all', 'accept cookies', 'got it', 'i agree', 'verify', 'agree and continue', 'accept'];
+            var elements = document.querySelectorAll('button, a, div[role="button"]');
+            for(var i = 0; i < elements.length; i++) {
+                if (keywords.some(kw => elements[i].innerText.toLowerCase().includes(kw))) { elements[i].click(); }
+            }
+            var divs = document.querySelectorAll('div');
+            for(var j = 0; j < divs.length; j++) {
+                var style = window.getComputedStyle(divs[j]);
+                if ((style.position === 'fixed' || style.position === 'sticky') && parseInt(style.zIndex) > 900) {
+                    if(divs[j].offsetHeight > window.innerHeight * 0.15) { divs[j].remove(); }
+                }
+            }
+        } catch(e) {}
+        """
+        try: driver.execute_script(js_destroyer)
+        except: pass
+
+def sanitize_filename(name: str) -> str:
+    return re.sub(r'[\\/*?:"<>|]', "", str(name)).strip()
+
+def sanitize_doi(doi_raw: str) -> str:
+    if not doi_raw or str(doi_raw).strip().lower() in ('nan', 'none', ''): return ''
+    doi = str(doi_raw).strip()
+    doi = re.sub(r'^https?://(dx\.)?doi\.org/', '', doi, flags=re.IGNORECASE)
+    doi = re.split(r'[?#]', doi)[0].strip().strip('/')
+    return doi if doi.startswith('10.') else ''
+
 class ScraperEngine:
-    def __init__(self, excel_path, log_callback, progress_callback, max_workers=3, paywall_wait_seconds=15):
+    def __init__(self, excel_path, log_callback, progress_callback, max_workers=1, paywall_wait_seconds=15):
         self.excel_path = excel_path
         self.log_callback = log_callback
         self.progress_callback = progress_callback
-        self.max_workers = max_workers
+        self.max_workers = 1 # Force 1 for stability
         self.paywall_wait_seconds = paywall_wait_seconds
         self.running = True
-        self.output_dir = os.path.join(os.path.dirname(excel_path), "extracted_literature")
+        self.output_dir = os.path.join(os.path.expanduser('~'), "Downloads")
         os.makedirs(self.output_dir, exist_ok=True)
-        self.rules = self.load_rules()
-        self.driver_pool = queue.Queue()
+        os.makedirs(EDGE_MASTER_PROFILE, exist_ok=True)
+        
+        self.master_profile = EDGE_MASTER_PROFILE
+        self.state_file = os.path.join(self.output_dir, "scraping_state.json")
+        self.completed_dois = self.load_state()
+        self.tracked_excel_path = os.path.join(self.output_dir, "Tracked_" + os.path.basename(self.excel_path))
+        
+        self.df = pd.read_excel(self.excel_path)
+        if 'Extraction_Status' not in self.df.columns: self.df['Extraction_Status'] = ""
+        if 'Content_Type' not in self.df.columns: self.df['Content_Type'] = ""
 
-    def log(self, msg_type, data):
-        self.log_callback(msg_type, data)
-
-    def load_rules(self):
-        rules_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "journal_rules.json")
-        try:
-            with open(rules_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            self.log("error", f"Failed to load journal rules: {e}. Using default.")
-            return {"default": {"pdf_meta_tag": "citation_pdf_url", "button_xpath": "//button[contains(., 'Download PDF')]", "timeout": 20}}
-
-    def stop(self):
-        self.running = False
-
-    def initialize_drivers(self):
-        self.log("log", f"Initializing {self.max_workers} browser instances sequentially...")
-        for i in range(self.max_workers):
-            if not self.running:
-                break
+    def load_state(self):
+        if os.path.exists(self.state_file):
             try:
-                binary_location = None
-                if os.path.exists('/usr/bin/chromium'):
-                    binary_location = '/usr/bin/chromium'
-                elif os.path.exists('/usr/bin/chromium-browser'):
-                    binary_location = '/usr/bin/chromium-browser'
-                
-                # Use headless=False + explicit virtual display on Linux to defeat Cloudflare
-                is_linux = (os.name != 'nt')
-                
-                driver = Driver(
-                    uc=True, 
-                    headless=False,
-                    binary_location=binary_location
-                )
-                self.driver_pool.put(driver)
-                self.log("log", f"Browser {i+1} initialized.")
-            except Exception as e:
-                self.log("error", f"Failed to init browser {i+1}: {e}")
+                with open(self.state_file, "r") as f: return set(json.load(f))
+            except: pass
+        return set()
 
-    def cleanup_drivers(self):
-        self.log("log", "Cleaning up browser instances...")
-        close_count = 0
-        while not self.driver_pool.empty():
-            driver = self.driver_pool.get()
-            try:
-                driver.quit()
-                close_count += 1
-            except:
-                pass
-        self.log("log", f"Cleaned up {close_count} browsers.")
-
-    def run(self):
+    def save_state(self, doi):
+        if not doi or str(doi) == 'nan': return
+        self.completed_dois.add(doi)
         try:
-            self.log("log", "Reading Excel file...")
-            df = pd.read_excel(self.excel_path)
-            
-            required_cols = ['DOI', 'Article Name', 'Format Name']
-            for col in required_cols:
-                if col not in df.columns:
-                    self.log("error", f"Missing required column: {col}")
-                    return
-
-            duplicate_dois = df[df.duplicated(subset=['DOI'], keep=False)]['DOI'].dropna().unique()
-            self.log("log", f"Found {len(duplicate_dois)} duplicate DOIs for Conference process.")
-
-            self.initialize_drivers()
-            if not self.running:
-                self.cleanup_drivers()
-                return
-
-            total_rows = len(df)
-            completed = 0
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = []
-                for index, row in df.iterrows():
-                    futures.append(executor.submit(self.process_row_with_driver, row, duplicate_dois))
-
-                for future in concurrent.futures.as_completed(futures):
-                    if not self.running:
-                        self.log("log", "Process stopped by user.")
-                        break
-                    try:
-                        future.result()
-                    except Exception as e:
-                        self.log("error", f"Thread error: {e}")
-                    
-                    completed += 1
-                    progress = completed / total_rows
-                    self.progress_callback(progress)
-
-            self.log("done", None)
-        except Exception as e:
-            self.log("error", f"Fatal error: {str(e)}")
-        finally:
-            self.cleanup_drivers()
-            self.log_callback("done", None) # Trigger the UI to know it definitively finished
-
-    def process_row_with_driver(self, row, duplicate_dois):
-        if not self.running:
-            return
-            
-        driver = self.driver_pool.get()
-        try:
-            self.process_row(driver, row, duplicate_dois)
-        finally:
-            self.driver_pool.put(driver)
-
-    def process_row(self, driver, row, duplicate_dois):
-        doi = str(row['DOI']).strip()
-        article_name = str(row['Article Name']).strip()
-        format_name = str(row['Format Name']).strip()
-        bing_link = str(row.get('Bing Link', '')).strip()
-
-        is_conference = doi in duplicate_dois
-        
-        self.log("log", f"Processing: {article_name}")
-
-        if not doi or doi == 'nan' or not doi.startswith('http'):
-            self.log("log", f"Invalid/Missing DOI for {article_name}. Attempting Route 4 (Bing).")
-            if self.route_4_bing_fallback(driver, article_name, bing_link, format_name):
-                return
-            self.log("log", f"Failed to extract {article_name} via Bing.")
-            return
-
-        try:
-            if hasattr(driver, "uc_open_with_reconnect"):
-                driver.uc_open_with_reconnect(doi, reconnect_time=3)
-            else:
-                driver.get(doi)
-            time.sleep(4)
-            
-            page_text = driver.get_page_source().lower()
-            if "error" in driver.get_current_url().lower() or "not found" in page_text:
-                 self.log("log", f"DOI appears dead for {article_name}. Attempting Route 4 (Bing).")
-                 if self.route_4_bing_fallback(driver, article_name, bing_link, format_name):
-                     return
-                 self.log("log", f"Failed to extract {article_name} via Bing.")
-                 return
-                 
-        except Exception as e:
-            self.log("log", f"Failed to navigate to DOI: {e}. Attempting Bing.")
-            self.route_4_bing_fallback(driver, article_name, bing_link, format_name)
-            return
-
-        current_url = driver.get_current_url()
-        domain = urlparse(current_url).netloc.replace("www.", "")
-        
-        self.log("log", f"Redirected to domain: {domain} for {article_name}")
-
-        if is_conference:
-            self.log("log", f"Executing Route 3 (Conference/Duplicate DOI) for {article_name}.")
-            if self.route_3_conference(driver, article_name, format_name):
-                return
-
-        rule = self.rules.get("default", {})
-        for k in self.rules.keys():
-            if k in domain and k != "default":
-                rule = self.rules[k]
-                break
-
-        # Check for paywall BEFORE attempting expensive browser extraction
-        raw_doi = doi.replace("https://doi.org/", "").replace("http://doi.org/", "").strip()
-        if self.is_paywall_page(driver):
-            wait = rule.get("paywall_wait", self.paywall_wait_seconds)
-            self.log("log", f"⏳ PAYWALL detected for '{article_name}'. Waiting {wait}s for session redirect...")
-            self.log("screenshot", driver.get_screenshot_as_base64())
-            time.sleep(wait)
-            # If wait resolved it (e.g. institutional redirect), try again
-            if not self.is_paywall_page(driver):
-                self.log("log", f"✅ Paywall resolved after wait for '{article_name}'. Retrying Route 1...")
-                if self.execute_route_1_and_2(driver, rule, format_name, article_name):
-                    return
-            # Still paywalled — go straight to Unpaywall API
-            self.log("log", f"🔓 Paywall still active. Querying Unpaywall REST API for '{article_name}'...")
-            if self.route_paywall_api(driver, raw_doi, format_name, article_name):
-                return
-            self.log("log", f"All paywall bypass routes exhausted for '{article_name}'.")
-            return
-        
-        success = self.execute_route_1_and_2(driver, rule, format_name, article_name)
-        if not success:
-            self.log("log", f"Browser extraction failed. Trying Unpaywall API for {article_name}...")
-            if not self.route_paywall_api(driver, raw_doi, format_name, article_name):
-                self.log("log", f"All extraction routes failed for {article_name}.")
-
-    def is_paywall_page(self, driver):
-        """Return True if the current browser page appears to be behind a paywall."""
-        try:
-            page_text = (driver.get_page_source() or "").lower()
-            return any(kw in page_text for kw in PAYWALL_KEYWORDS)
-        except:
-            return False
-
-    def execute_route_1_and_2(self, driver, rule, format_name, article_name):
-        timeout = rule.get("timeout", 15)
-        pdf_meta = rule.get("pdf_meta_tag", "citation_pdf_url")
-        xpath_btn = rule.get("button_xpath", "")
-
-        try:
-            driver.implicitly_wait(min(timeout, 5))
-            meta_element = driver.find_elements(By.CSS_SELECTOR, f"meta[name='{pdf_meta}']")
-            if meta_element:
-                pdf_url = meta_element[0].get_attribute("content")
-                if pdf_url:
-                    self.log("log", f"Found PDF via meta tag for {article_name}. Navigating...")
-                    driver.get(pdf_url)
-                    time.sleep(5)
-                    self.log("screenshot", driver.get_screenshot_as_base64())
-                    try:
-                        if driver.is_element_present("iframe[src*='cloudflare']"):
-                            self.log("log", "Cloudflare intercepted. Auto-clicking CAPTCHA...")
-                            driver.uc_gui_click_captcha()
-                            time.sleep(6)
-                            self.log("screenshot", driver.get_screenshot_as_base64())
-                    except: pass
-                    # Check for paywall on the PDF page itself
-                    if self.is_paywall_page(driver):
-                        wait = rule.get("paywall_wait", self.paywall_wait_seconds)
-                        self.log("log", f"⏳ PDF page also paywalled for {article_name}. Waiting {wait}s...")
-                        time.sleep(wait)
-                    if self.save_pdf_from_browser(driver, format_name, xpath_btn):
-                        return True
-            
-            if xpath_btn:
-                try:
-                    if driver.is_element_present(xpath_btn):
-                        self.log("log", f"Found PDF button for {article_name}. Clicking...")
-                        btn_href = driver.find_element(By.XPATH, xpath_btn).get_attribute("href")
-                        if btn_href: driver.get(btn_href)
-                        else: driver.click(xpath_btn)
-                        time.sleep(5)
-                        self.log("screenshot", driver.get_screenshot_as_base64())
-                        try:
-                            if driver.is_element_present("iframe[src*='cloudflare']"):
-                                driver.uc_gui_click_captcha()
-                                time.sleep(6)
-                                self.log("screenshot", driver.get_screenshot_as_base64())
-                        except: pass
-                        if self.save_pdf_from_browser(driver, format_name, xpath_btn):
-                            return True
-                except:
-                    pass
-                
-        except Exception as e:
-            self.log("log", f"Route 1 exception for {article_name}: {e}")
-        finally:
-            driver.implicitly_wait(10)
-
-        # CAPTCHA retry: if current page has "Just a moment" or CF challenge, click and retry
-        try:
-            page_title = driver.title.lower()
-            if "just a moment" in page_title or "cloudflare" in page_title or "security" in page_title:
-                self.log("log", f"Cloudflare challenge page detected for {article_name}. Auto-clicking...")
-                try:
-                    driver.uc_gui_click_captcha()
-                    time.sleep(8)
-                    self.log("screenshot", driver.get_screenshot_as_base64())
-                except Exception as cf_e:
-                    self.log("log", f"CAPTCHA click error: {cf_e}")
-                xpath_btn = rule.get("button_xpath", "") if isinstance(rule, dict) else ""
-                if self.save_pdf_from_browser(driver, format_name, xpath_btn):
-                    return True
+            with open(self.state_file, "w") as f: json.dump(list(self.completed_dois), f)
         except: pass
 
-        self.log("log", f"Route 1 failed for {article_name}.")
-        return False
+    def log(self, msg_type, data): self.log_callback(msg_type, data)
+    def stop(self): self.running = False
 
-    def route_2_print_abstract(self, driver, format_name, article_name="article"):
+    def _build_edge_driver(self):
+        return Driver(browser="edge", uc=False, headless=False, user_data_dir=self.master_profile, chromium_arg=" ".join(EDGE_ARGS), do_not_track=True)
+
+    def initialize_driver(self):
+        self.log("log", "Initializing Autonomous Engine...")
+        profile_ready = os.path.exists(os.path.join(self.master_profile, "Default"))
         try:
-            pdf_data = driver.execute_cdp_cmd("Page.printToPDF", {
-                "landscape": False,
-                "displayHeaderFooter": False,
-                "printBackground": True,
-                "preferCSSPageSize": True
-            })
+            warmup = self._build_edge_driver()
+            warmup.get("https://google.com")
+            if not profile_ready:
+                self.log("log", "[Action Required] Log into Zscaler/Azure AD. You have 90s.")
+                time.sleep(90) 
+            else: time.sleep(10)
+            warmup.quit()
+            time.sleep(3) 
+            if os.name == 'nt': subprocess.call("TASKKILL /F /IM msedge.exe /T", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(2)
             
-            pdf_bytes = base64.b64decode(pdf_data['data'])
-            save_path = os.path.join(self.output_dir, f"{format_name}.pdf")
-            
-            with open(save_path, "wb") as f:
-                f.write(pdf_bytes)
+            driver = self._build_edge_driver()
+            try: driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_SCRIPT})
+            except: pass
+            return driver
+        except Exception as e: 
+            self.log("error", f"Auth warmup failed: {e}")
+            return None
+
+    def run(self):
+        driver = None
+        try:
+            driver = self.initialize_driver()
+            if not self.running or not driver: return
+
+            total_rows = len(self.df)
+            for current_index in range(total_rows):
+                if not self.running: break
                 
-            self.log("log", f"Saved abstract to: {format_name}.pdf")
-            self.count_pdf_pages(save_path)
-            return True
-        except Exception as e:
-            self.log("log", f"Route 2 error for {article_name}: {e}")
-            return False
+                row = self.df.iloc[current_index]
+                self.progress_callback((current_index + 1) / total_rows)
+                
+                if row.get('Extraction_Status') == "Success": continue
+                    
+                status, c_type = self.process_row_with_driver(driver, row)
 
-    def count_pdf_pages(self, pdf_path):
-        try:
-            doc = fitz.open(pdf_path)
-            self.log("log", f"PDF saved with {doc.page_count} pages.")
-            doc.close()
-        except:
-            pass
+                # Live Excel Update
+                self.df.at[current_index, 'Extraction_Status'] = "Success" if status else "Failed"
+                self.df.at[current_index, 'Content_Type'] = c_type
+                self.df.to_excel(self.tracked_excel_path, index=False)
 
-    def route_3_conference(self, driver, article_name, format_name):
+        finally:
+            if driver:
+                try: driver.quit()
+                except: pass
+            self.log_callback("done", None) 
+
+    def process_row_with_driver(self, driver, row):
+        doi = str(row['DOI']).strip()
+        article_name = str(row['Article Name']).strip()
+        format_name = sanitize_filename(str(row['Format Name']).strip())
+        bing_link = str(row.get('Bing Link', '')).strip()
+
+        self.log("log", f"\n=== FOCUS: {article_name} ===")
+
+        target_url = doi if (doi and doi != 'nan' and doi.startswith('http')) else (bing_link if str(bing_link) != 'nan' else f"https://www.bing.com/search?q={article_name}")
+        
         try:
-            paragraphs = driver.find_elements(By.CSS_SELECTOR, "p")
-            best_match = None
+            driver.get(target_url)
+            HumanSimulator.human_delay(3.0, 5.0)
+            HumanSimulator.annihilate_overlays(driver)
+            HumanSimulator.organic_scroll(driver)
+            HumanSimulator.annihilate_overlays(driver)
+        except: pass
+
+        # Route 1: Try Native JS PDF Extraction
+        if self.save_pdf_from_browser(driver, format_name):
+            self.save_state(sanitize_doi(doi))
+            return True, "Full Native PDF"
+
+        # Route 2: Smart Ctrl+A Extraction (1000 words)
+        self.log("log", "Native PDF failed. Initiating Smart Content Match...")
+        success, content_type = self.smart_extract_text(driver, article_name, format_name)
+        if success:
+            self.save_state(sanitize_doi(doi))
+            return True, content_type
+
+        # Route 3: Unpaywall API Fallback
+        self.log("log", "Falling back to Unpaywall API...")
+        if self.route_paywall_api(driver, sanitize_doi(doi), format_name):
+            self.save_state(sanitize_doi(doi))
+            return True, "Full Native PDF (Unpaywall)"
+        
+        return False, "Failed"
+
+    def smart_extract_text(self, driver, article_name, format_name):
+        """
+        Acts like Ctrl+A. Uses Fuzzy Logic to find the abstract title.
+        Grabs up to 1000 words following the title and saves to a clean PDF.
+        """
+        try:
+            body_text = driver.execute_script("return document.body.innerText;")
+            if not body_text or len(body_text.strip()) < 50:
+                return False, "No Text Found"
+
+            paragraphs = [p.strip() for p in body_text.split('\n') if len(p.strip()) > 10]
+            total_words = len(" ".join(paragraphs).split())
+            
+            best_idx = -1
             best_score = 0
             
-            for p in paragraphs:
-                text = p.text.strip()
-                if not text: continue
-                score = fuzz.token_set_ratio(article_name, text)
+            for i, p in enumerate(paragraphs):
+                score = fuzz.token_set_ratio(article_name, p)
                 if score > best_score:
                     best_score = score
-                    best_match = text
-                    
-            if best_score > 90 and best_match:
-                self.log("log", f"Found high-confidence conference abstract (Score: {best_score}) for {article_name}.")
-                pdf = FPDF()
-                pdf.add_page()
-                pdf.set_font("Arial", size=12)
-                safe_text = best_match.encode('latin-1', 'replace').decode('latin-1')
-                pdf.multi_cell(0, 10, txt=safe_text)
+                    best_idx = i
+                        
+            # If we find a solid match for the article title
+            if best_score > 65 and best_idx != -1:
+                self.log("log", f"🎯 Match Found! Extracting up to 1000 words...")
+                extracted_words = []
+                word_count = 0
                 
-                save_path = os.path.join(self.output_dir, f"{format_name}_conference.pdf")
-                pdf.output(save_path)
-                self.log("log", f"Saved conference abstract: {format_name}_conference.pdf")
-                return True
-            else:
-                self.log("log", f"No matching abstract found > 90% (Best: {best_score}) for {article_name}.")
-                return False
+                for p in paragraphs[best_idx:]:
+                    words = p.split()
+                    if word_count + len(words) > 1000:
+                        remaining = 1000 - word_count
+                        extracted_words.extend(words[:remaining])
+                        extracted_words.append("... [Text Truncated at 1000 words]")
+                        break
+                    else:
+                        extracted_words.extend(words)
+                        word_count += len(words)
+                        
+                final_text = " ".join(extracted_words)
+                
+                # Logic to determine if it's an abstract or a full snippet
+                c_type = "Extracted Abstract" if total_words < 2500 else "Extracted Snippet (1000w)"
+                
+                self.generate_clean_pdf(final_text, article_name, format_name)
+                return True, c_type
+                
+            self.log("log", "❌ Title not found in page text.")
+            return False, "Title Mismatch"
         except Exception as e:
-            self.log("log", f"Route 3 error for {article_name}: {e}")
-            return False
+            self.log("error", f"Smart extract failed: {e}")
+            return False, "Error"
 
-
-    def route_paywall_api(self, driver, doi, format_name, article_name):
-        """
-        Query the Unpaywall REST API (https://api.unpaywall.org/v2/{doi}?email=) to find a
-        free, legal Open Access PDF. Browser cookies are forwarded so institutional session
-        PDFs also work. Falls back to printing the abstract page if nothing is found.
-        """
-        import requests
-
-        # ── 1. Build a requests session that carries the browser's cookies ──────────
-        session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; LiteratureScraper/1.0; mailto:scraper@example.com)"})
-        try:
-            for cookie in driver.get_cookies():
-                session.cookies.set(cookie["name"], cookie["value"],
-                                    domain=cookie.get("domain", ""))
-        except Exception as ce:
-            self.log("log", f"Could not transfer browser cookies: {ce}")
-
-        # ── 2. Query Unpaywall REST API ───────────────────────────────────────────
-        unpaywall_email = "scraper@example.com"  # required by Unpaywall ToS
-        api_url = f"https://api.unpaywall.org/v2/{doi}?email={unpaywall_email}"
-        self.log("log", f"📡 Querying Unpaywall REST API for DOI: {doi}")
-
-        try:
-            resp = session.get(api_url, timeout=12)
-            if resp.status_code == 200:
-                data = resp.json()
-                is_oa = data.get("is_oa", False)
-                self.log("log", f"Unpaywall: is_oa={is_oa}, title='{data.get('title', '')}' for {article_name}")
-
-                # Collect candidate PDF URLs: best_oa_location first, then remaining oa_locations
-                locations = []
-                best = data.get("best_oa_location")
-                if best:
-                    locations.append(best)
-                for loc in data.get("oa_locations", []):
-                    if loc not in locations:
-                        locations.append(loc)
-
-                for loc in locations:
-                    pdf_url = loc.get("url_for_pdf") or loc.get("url")
-                    if not pdf_url:
-                        continue
-
-                    host_type = loc.get("host_type", "unknown")
-                    version = loc.get("version", "unknown")
-                    self.log("log", f"Unpaywall OA candidate ({host_type}/{version}): {pdf_url}")
-
-                    try:
-                        # First try a direct requests download (fast, no browser overhead)
-                        pdf_resp = session.get(pdf_url, timeout=35, stream=True)
-                        content_type = pdf_resp.headers.get("Content-Type", "").lower()
-
-                        if "application/pdf" in content_type:
-                            save_path = os.path.join(self.output_dir, f"{format_name}.pdf")
-                            with open(save_path, 'wb') as f:
-                                for chunk in pdf_resp.iter_content(chunk_size=8192):
-                                    if chunk:
-                                        f.write(chunk)
-                            self.log("log", f"✅ Unpaywall PDF saved directly: {format_name}.pdf")
-                            self.count_pdf_pages(save_path)
-                            return True
-                        else:
-                            # Content-type is HTML/redirect — navigate browser and try JS fetch
-                            self.log("log", f"Not a direct PDF ({content_type}). Trying via browser for {article_name}...")
-                            driver.get(pdf_url)
-                            time.sleep(5)
-                            if self.is_paywall_page(driver):
-                                self.log("log", f"OA URL also paywalled. Skipping: {pdf_url}")
-                                continue
-                            if self.save_pdf_from_browser(driver, format_name, ""):
-                                return True
-
-                    except Exception as loc_e:
-                        self.log("log", f"Failed OA URL {pdf_url}: {loc_e}")
-                        continue
-
-            elif resp.status_code == 404:
-                self.log("log", f"Unpaywall: DOI not found ({doi})")
-            else:
-                self.log("log", f"Unpaywall returned HTTP {resp.status_code} for {doi}")
-
-        except Exception as e:
-            self.log("log", f"Unpaywall API error: {e}")
-
-        # ── 3. Final fallback: print the current browser page as an abstract PDF ──
-        self.log("log", f"No OA PDF found. Printing current page as abstract for '{article_name}'.")
-        return self.route_2_print_abstract(driver, format_name, article_name)
-
-    def route_unpaywall(self, driver, doi, format_name, article_name):
-        """Legacy alias — delegates to route_paywall_api."""
-        return self.route_paywall_api(driver, doi, format_name, article_name)
-
-    def route_4_bing_fallback(self, driver, article_name, bing_link, format_name):
-        self.log("log", f"Executing Route 4 for: {article_name}")
-        try:
-            search_url = bing_link if bing_link and bing_link != 'nan' else f"https://www.bing.com/search?q={article_name}"
-            if hasattr(driver, "uc_open_with_reconnect"):
-                driver.uc_open_with_reconnect(search_url, reconnect_time=2)
-            else:
-                driver.get(search_url)
-            time.sleep(3)
-            
-            results = driver.find_elements(By.CSS_SELECTOR, "li.b_algo h2 a")
-            urls = [el.get_attribute("href") for el in results[:10]]
-            
-            for url in urls:
-                if not self.running: break
-                if not url: continue
-                
-                self.log("log", f"Checking Bing result: {url}")
-                driver.get(url)
-                time.sleep(3)
-                
-                page_title = driver.title
-                page_body = driver.get_text("body")[:5000]
-                
-                title_score = fuzz.token_set_ratio(article_name, page_title)
-                body_score = fuzz.token_set_ratio(article_name, page_body)
-                
-                if max(title_score, body_score) > 90:
-                    self.log("log", f"High match found in Bing results for {article_name}. Proceeding with Route 1 & 2.")
-                    domain = urlparse(url).netloc.replace("www.", "")
-                    rule = self.rules.get(domain, self.rules.get("default", {}))
-                    return self.execute_route_1_and_2(driver, rule, format_name, article_name)
-                    
-            self.log("log", f"No matching results found in top 10 Bing URLs for {article_name}.")
-            return False
-        except Exception as e:
-             self.log("log", f"Route 4 error for {article_name}: {e}")
-             return False
-
-    def save_pdf_from_browser(self, driver, format_name, xpath_btn=""):
-        self.log("log", f"Finding and extracting raw PDF bytes...")
-        self.log("screenshot", driver.get_screenshot_as_base64())
-        current_url = driver.get_current_url()
-        candidate_urls = [current_url]
+    def generate_clean_pdf(self, text, article_name, format_name):
+        """Uses FPDF to create a beautifully formatted text PDF."""
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
         
-        if xpath_btn:
-            try:
-                for el in driver.find_elements(By.XPATH, xpath_btn):
-                    href = el.get_attribute("href")
-                    if href and href not in candidate_urls: candidate_urls.insert(0, href)
-            except: pass
-                
+        # Add Header
+        pdf.set_font("Arial", style="B", size=14)
+        safe_title = article_name.encode('latin-1', 'replace').decode('latin-1')
+        pdf.multi_cell(0, 10, txt=f"Article: {safe_title}")
+        pdf.ln(5)
+        
+        # Add Body
+        pdf.set_font("Arial", size=11)
+        safe_text = text.encode('latin-1', 'replace').decode('latin-1')
+        pdf.multi_cell(0, 8, txt=safe_text)
+        
+        save_path = os.path.join(self.output_dir, f"{format_name}.pdf")
+        pdf.output(save_path)
+        self.log("log", f"✅ Clean Text PDF Generated: {format_name}.pdf")
+
+    def save_pdf_from_browser(self, driver, format_name):
+        candidate_urls = [driver.get_current_url()]
         try:
             for iframe in driver.find_elements(By.TAG_NAME, "iframe"):
                 src = iframe.get_attribute("src")
-                if src and ("pdf" in src.lower() or "download" in src.lower()) and src not in candidate_urls:
-                    candidate_urls.insert(0, src)
-        except: pass
-            
-        try:
-            for link in driver.find_elements(By.XPATH, "//a[contains(@href, '.pdf') or @title='ePDF' or contains(@class, 'pdf-btn') or contains(@class, 'coolBar-download') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download pdf')]"):
-                href = link.get_attribute("href")
-                if href and href not in candidate_urls and not href.startswith("javascript"): candidate_urls.insert(0, href)
-        except: pass
-        
-        try:
-            if "onlinelibrary.wiley.com/doi/pdf/" in current_url: candidate_urls.insert(0, current_url.replace("/doi/pdf/", "/doi/pdfdirect/").split("?")[0] + "?download=true")
-            elif "/doi/epdf/" in current_url: candidate_urls.insert(0, current_url.replace("/doi/epdf/", "/doi/pdf/").split("?")[0] + "?download=true")
-            elif "literatumonline.com/doi/pdf/" in current_url: candidate_urls.insert(0, current_url.replace("/doi/pdf/", "/doi/pdfdirect/").split("?")[0] + "?download=true")
+                if src and ("pdf" in src.lower() or "download" in src.lower()): candidate_urls.insert(0, src)
         except: pass
 
         fetch_script = """
-        var url = arguments[0];
-        var callback = arguments[1];
-        fetch(url, {credentials: 'include'})
-            .then(response => {
-                const ct = response.headers.get("content-type") || "";
-                if (ct.includes("pdf")) {
-                    return response.blob().then(blob => {
-                        var reader = new FileReader();
-                        reader.onload = function() {
-                            callback({success: true, data: reader.result, type: ct});
-                        };
-                        reader.readAsDataURL(blob);
-                    });
-                } else {
-                    callback({success: false, error: "Not a PDF: " + ct});
-                }
-            })
-            .catch(error => {
-                callback({success: false, error: error.message});
-            });
+        var url = arguments[0]; var cb = arguments[1];
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 15000); 
+        fetch(url, {credentials: 'include', signal: controller.signal}).then(r => {
+            clearTimeout(timeoutId);
+            if (r.headers.get("content-type").includes("pdf")) {
+                r.blob().then(b => {
+                    var reader = new FileReader();
+                    reader.onload = () => cb({s: true, d: reader.result});
+                    reader.readAsDataURL(b);
+                });
+            } else { cb({s: false}); }
+        }).catch(() => { clearTimeout(timeoutId); cb({s: false}); });
         """
-        
         try:
-            driver.set_script_timeout(30)
+            driver.set_script_timeout(20)
             for test_url in candidate_urls:
-                try:
-                    self.log("log", f"Testing candidate securely via Browser JS: {test_url}")
-                    result = driver.execute_async_script(fetch_script, test_url)
-                    if result and result.get("success"):
-                        b64_data = result.get("data", "")
-                        if "," in b64_data: b64_data = b64_data.split(",")[1]
-                        
-                        import base64
-                        pdf_bytes = base64.b64decode(b64_data)
-                        save_path = os.path.join(self.output_dir, f"{format_name}.pdf")
-                        with open(save_path, 'wb') as f: f.write(pdf_bytes)
-                                
-                        self.log("log", f"✅ Original PDF elegantly saved via Browser JS: {format_name}.pdf")
-                        self.count_pdf_pages(save_path)
-                        return True
-                except Exception as loop_e:
-                    self.log("log", f"JS Fetch failed for {test_url}: {str(loop_e)}")
-        except Exception as e: self.log("log", f"PDF download logic error: {e}")
-            
-        self.log("log", f"No raw PDF stream found natively. Falling back to print.")
-        self.route_2_print_abstract(driver, format_name)
+                res = driver.execute_async_script(fetch_script, test_url)
+                if res and res.get("s"):
+                    b64_data = res.get("d", "").split(",")[-1]
+                    save_path = os.path.join(self.output_dir, f"{format_name}.pdf")
+                    with open(save_path, 'wb') as f: f.write(base64.b64decode(b64_data))
+                    return True
+        except: pass
         return False
+
+    def route_paywall_api(self, driver, doi, format_name):
+        if not doi: return False
+        with requests.Session() as session:
+            session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            try:
+                for cookie in driver.get_cookies(): session.cookies.set(cookie["name"], cookie["value"], domain=cookie.get("domain", ""))
+            except: pass
+            try:
+                resp = session.get(f"https://api.unpaywall.org/v2/{quote(doi, safe='/')}?email=scraper@example.com", timeout=15)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    locs = [data.get("best_oa_location")] + data.get("oa_locations", [])
+                    for loc in filter(None, locs):
+                        url = loc.get("url_for_pdf") or loc.get("url")
+                        if not url: continue
+                        try:
+                            pdf_resp = session.get(url, timeout=30, stream=True)
+                            if "application/pdf" in pdf_resp.headers.get("Content-Type", "").lower():
+                                save_path = os.path.join(self.output_dir, f"{format_name}.pdf")
+                                with open(save_path, 'wb') as f:
+                                    for chunk in pdf_resp.iter_content(8192): f.write(chunk)
+                                return True
+                        except: continue
+            except: pass
+            return False
