@@ -13,7 +13,6 @@ from fpdf import FPDF
 import fitz  # PyMuPDF
 
 # --- Linux / Streamlit Cloud Display Hack ---
-# This creates a virtual invisible screen for the headless browser to render on
 if os.name != 'nt':
     try:
         from pyvirtualdisplay import Display
@@ -32,7 +31,6 @@ STEALTH_SCRIPT = """
 """
 
 def sanitize_filename(name: str) -> str:
-    """Removes illegal characters from filenames to prevent OS saving errors."""
     return re.sub(r'[\\/*?:"<>|]', "", str(name)).strip()
 
 def sanitize_doi(doi_raw: str) -> str:
@@ -43,8 +41,7 @@ def sanitize_doi(doi_raw: str) -> str:
     return doi if doi.startswith('10.') else ''
 
 class ScraperEngine:
-    # Accepts *args and **kwargs to prevent your Streamlit frontend from crashing if it passes extra arguments
-    def __init__(self, excel_path, log_callback, progress_callback, *args, **kwargs):
+    def __init__(self, excel_path, log_callback, progress_callback, max_workers=1, paywall_wait_seconds=15):
         self.excel_path = excel_path
         self.log_callback = log_callback
         self.progress_callback = progress_callback
@@ -54,10 +51,12 @@ class ScraperEngine:
         self.output_dir = "./scraped_pdfs"
         os.makedirs(self.output_dir, exist_ok=True)
         
+        # CRITICAL FIX: Initialize tracked_excel_path for the frontend
+        self.tracked_excel_path = None
+        
         self.state_file = os.path.join(self.output_dir, "scraping_state.json")
         self.completed_dois = self.load_state()
         
-        # Load Data
         self.df = pd.read_excel(self.excel_path)
         if 'Action_Taken' not in self.df.columns: self.df['Action_Taken'] = ""
         if 'Extraction_Status' not in self.df.columns: self.df['Extraction_Status'] = ""
@@ -76,31 +75,25 @@ class ScraperEngine:
             with open(self.state_file, "w") as f: json.dump(list(self.completed_dois), f)
         except: pass
 
-    def log(self, msg_type, data): 
-        self.log_callback(msg_type, data)
-        
-    def stop(self): 
-        self.running = False
+    def log(self, msg_type, data): self.log_callback(msg_type, data)
+    def stop(self): self.running = False
 
     def validate_pdf(self, pdf_path, article_name="", is_conference=False):
         if not os.path.exists(pdf_path): return False
         try:
             size_kb = os.path.getsize(pdf_path) / 1024
             if is_conference: return size_kb > 1
-            if size_kb < 30: # 30kb minimum threshold to filter out paywall login pages
-                self.log("error", f"❌ Junk PDF detected (Size {size_kb:.1f}KB). Deleting.")
+            if size_kb < 30: 
+                self.log("error", f"❌ Junk PDF (Size {size_kb:.1f}KB). Deleting.")
                 os.remove(pdf_path)
                 return False
-            
             doc = fitz.open(pdf_path)
             pages = doc.page_count
             doc.close()
-            
             if pages <= 1:
-                self.log("error", f"❌ Junk PDF detected (Only 1 Page). Deleting.")
+                self.log("error", f"❌ Junk PDF (1 Page). Deleting.")
                 os.remove(pdf_path)
                 return False
-                
             self.log("log", f"✅ PDF Validated: {pages} pages, {size_kb:.1f}KB.")
             return True
         except Exception:
@@ -109,17 +102,13 @@ class ScraperEngine:
             return False
 
     def _build_cloud_driver(self):
-        """
-        Builds a strictly headless Chrome browser utilizing Undetected Chromedriver (uc=True).
-        This is the only reliable way to bypass Cloudflare natively on Linux servers.
-        """
         try:
             driver = Driver(
                 browser="chrome",
-                uc=True,                    # Undetected mode to bypass bot protection
-                headless=True,              # Required for Streamlit Cloud
-                no_sandbox=True,            # Required for Linux Docker containers
-                disable_dev_shm_usage=True, # Prevents memory crashes on small cloud servers
+                uc=True,            
+                headless=True,      
+                no_sandbox=True,    
+                disable_dev_shm_usage=True, 
                 user_data_dir=os.path.join(BASE_PROFILE_DIR, "session")
             )
             try: driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_SCRIPT})
@@ -129,25 +118,11 @@ class ScraperEngine:
             self.log("error", f"Failed to init Cloud Driver: {e}")
             return None
 
-    def annihilate_overlays(self, driver):
-        """Autonomously clears cookie banners and 'accept' popups using pure JS."""
-        js = """
-        try {
-            var kws = ['accept', 'got it', 'agree', 'verify', 'continue'];
-            var els = document.querySelectorAll('button, a');
-            for(var i=0; i<els.length; i++) {
-                if (kws.some(kw => els[i].innerText.toLowerCase().includes(kw))) { els[i].click(); }
-            }
-        } catch(e) {}
-        """
-        try: driver.execute_script(js)
-        except: pass
-
     def run(self):
         driver = None
         try:
             duplicate_dois = self.df[self.df.duplicated(subset=['DOI'], keep=False)]['DOI'].dropna().unique()
-            self.log("log", "Booting Autonomous Headless Engine...")
+            self.log("log", "Booting Autonomous Cloud Engine...")
             driver = self._build_cloud_driver()
             
             if not self.running or not driver: return
@@ -162,10 +137,8 @@ class ScraperEngine:
                 if doi and doi != "nan" and doi in self.completed_dois:
                     continue
                     
-                # ── Autonomous Pipeline Execution ──
                 action_taken = self.process_row_autonomous(driver, row, duplicate_dois)
                 
-                # Check results
                 raw_format_name = str(row.get('Format Name', '')).strip()
                 clean_format_name = sanitize_filename(raw_format_name)
                 article_name = str(row.get('Article Name', '')).strip()
@@ -179,23 +152,19 @@ class ScraperEngine:
 
                 if extracted: self.save_state(doi)
 
-                # Update Dataframe Memory
                 self.df.at[index, 'Extraction_Status'] = "Success" if extracted else "Failed"
                 self.df.at[index, 'Action_Taken'] = action_taken
 
-                # Cycle driver periodically to clear memory on limited Streamlit servers
                 if index % 15 == 0 and index > 0:
                     try: driver.quit()
                     except: pass
                     driver = self._build_cloud_driver()
                     
-            # ── Final Save of the Tracking Excel ──
-            updated_excel_path = os.path.join(self.output_dir, "Tracked_" + os.path.basename(self.excel_path))
-            self.df.to_excel(updated_excel_path, index=False)
-            self.log("log", f"✅ Tracking Excel saved to: {updated_excel_path}")
+            # CRITICAL FIX: Save the path to self.tracked_excel_path so app.py can access it
+            self.tracked_excel_path = os.path.join(self.output_dir, "Tracked_" + os.path.basename(str(self.excel_path)))
+            self.df.to_excel(self.tracked_excel_path, index=False)
+            self.log("log", f"✅ Tracking Excel saved to: {self.tracked_excel_path}")
 
-        except Exception as e:
-            self.log("error", f"Fatal Engine Error: {e}")
         finally:
             if driver:
                 try: driver.quit()
@@ -203,7 +172,6 @@ class ScraperEngine:
             self.log_callback("done", None) 
 
     def process_row_autonomous(self, driver, row, duplicate_dois):
-        """The core logic that runs on every row without human intervention."""
         doi = str(row['DOI']).strip()
         article_name = str(row['Article Name']).strip()
         format_name = sanitize_filename(str(row['Format Name']).strip())
@@ -213,27 +181,36 @@ class ScraperEngine:
         if not doi or str(doi) == 'nan' or not doi.startswith('http'):
             return "Failed - Invalid DOI"
 
-        # 1. Attempt Native Navigation via UC Reconnect (Bypasses Cloudflare checks automatically)
         try:
-            self.log("log", "Navigating securely to source...")
-            driver.uc_open_with_reconnect(doi, reconnect_time=5)
+            driver.uc_open_with_reconnect(doi, reconnect_time=4)
             time.sleep(5)
             self.annihilate_overlays(driver)
-            
-            # Check for embedded PDF data
-            if self.auto_find_and_download(driver, format_name):
-                return "Autonomous HTML Extraction"
         except: pass
 
-        # 2. Fallback to Open Access Unpaywall API
-        self.log("log", "Attempting Unpaywall API Fetch...")
+        self.log("log", "Attempting Unpaywall API...")
         if self.route_paywall_api(driver, sanitize_doi(doi), format_name, article_name): 
             return "Unpaywall API Auto-Fetch"
+        
+        self.log("log", "Attempting Autonomous HTML Extraction...")
+        if self.auto_find_and_download(driver, format_name):
+            return "Autonomous HTML Extraction"
 
         return "Failed Automations"
 
+    def annihilate_overlays(self, driver):
+        js = """
+        try {
+            var kws = ['accept', 'got it', 'agree', 'verify'];
+            var els = document.querySelectorAll('button, a');
+            for(var i=0; i<els.length; i++) {
+                if (kws.some(kw => els[i].innerText.toLowerCase().includes(kw))) { els[i].click(); }
+            }
+        } catch(e) {}
+        """
+        try: driver.execute_script(js)
+        except: pass
+
     def auto_find_and_download(self, driver, format_name):
-        """Automatically hunts the DOM for PDF links and forces a download fetch."""
         candidate_urls = []
         try:
             for link in driver.find_elements(By.XPATH, "//a[contains(@href, '.pdf') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download pdf')]"):
@@ -267,7 +244,6 @@ class ScraperEngine:
         return False
 
     def route_paywall_api(self, driver, doi, format_name, article_name):
-        """Silently queries the Unpaywall API to extract legal Open Access alternatives."""
         if not doi: return False
         with requests.Session() as session:
             session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
