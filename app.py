@@ -4,6 +4,7 @@ import tempfile
 import time
 import threading
 import pandas as pd
+import gc
 from scraper_engine import ScraperEngine
 
 st.set_page_config(page_title="Literature Extractor", page_icon="📝", layout="wide")
@@ -27,7 +28,7 @@ if not st.session_state.authenticated:
                 st.rerun()
             else:
                 st.error("Invalid User ID or Password.")
-    st.stop()  # Stop execution of the rest of the app if not authenticated
+    st.stop()
 
 # Main Application starts here
 st.title("Literature Extractor")
@@ -36,17 +37,15 @@ st.title("Literature Extractor")
 with st.expander("ℹ️ User Instructions & Formats", expanded=False):
     st.markdown("""
     **What this tool does:**
-    This tool automates the process of extracting full-text academic articles using SeleniumBase. It uses a pool of concurrent headless browsers to navigate directly to DOIs, hunt for PDF metadata, or search Bing for fallback links, dramatically speeding up bulk literature retrieval.
+    This tool automates the process of extracting full-text academic articles using SeleniumBase. 
     
-    **Required Excel Format:**
-    Please uphold the following column names exactly in your uploaded `.xlsx` file:
-    *   **`DOI`**: The direct Document Object Identifier link (e.g., `https://doi.org/10.1016/...`).
-    *   **`Article Name`**: The full title of the paper. Used for fallback searches and conference abstract matching.
-    *   **`Format Name`**: The desired filename for the downloaded PDF output (e.g., `Smith_2023_Analysis`).
-    *   *(Optional)* **`Bing Link`**: A custom search URL if the DOI is known to be dead. (Auto-generated via article name if left blank).
+    **Required Columns:**
+    * **`DOI`**: The direct Document Object Identifier link.
+    * **`Article Name`**: The full title of the paper.
+    * **`Format Name`**: The desired filename for the downloaded PDF output.
+    * **`Bing Link`**: (Optional) Custom search URL.
     """)
 
-# Use a custom class instance to hold state instead of mutating st.session_state directly.
 class AppState:
     def __init__(self):
         self.logs = []
@@ -82,11 +81,11 @@ col1, col2 = st.columns([1, 2])
 
 with col1:
     st.subheader("Configuration")
-    max_workers = st.slider("Concurrent Browsers", min_value=1, max_value=5, value=2, help="Number of Chrome instances to run in parallel.")
-    paywall_wait = st.slider("Paywall Wait (s)", min_value=5, max_value=60, value=15,
-                             help="Seconds to wait after a paywall is detected before querying the Unpaywall API.")
+    max_workers = st.slider("Concurrent Browsers", min_value=1, max_value=5, value=1, help="Set to 1 if using HITL to keep window focus.")
+    paywall_wait = st.slider("Paywall Wait (s)", min_value=5, max_value=60, value=15)
     
-    tab1, tab2 = st.tabs(["Upload Excel", "Manual Entry"])
+    # Updated Tabs
+    tab1, tab2 = st.tabs(["Upload Excel", "Paste Data Grid"])
     
     tmp_path = None
     
@@ -100,26 +99,39 @@ with col1:
                     tmp_path = tmp.name
 
     with tab2:
-        doi_input = st.text_input("DOI", placeholder="https://doi.org/...")
-        article_input = st.text_input("Article Name*", help="Used for fallback searching if DOI fails")
-        format_input = st.text_input("Format Name*", placeholder="Smith_2024_Paper", help="Filename for the downloaded PDF")
+        st.markdown("**Click the top-left cell and press Ctrl+V to paste your data from Excel.**")
+        
+        # Initialize an empty dataframe with 15 rows for easy pasting
+        if "paste_df" not in st.session_state:
+            st.session_state.paste_df = pd.DataFrame(
+                [["", "", "", ""] for _ in range(15)], 
+                columns=["DOI", "Article Name", "Format Name", "Bing Link"]
+            )
+        
+        # Interactive Data Editor
+        edited_df = st.data_editor(
+            st.session_state.paste_df,
+            num_rows="dynamic", # Allows adding/deleting rows
+            use_container_width=True,
+            key="data_grid"
+        )
         
         if not state.is_scraping:
-            if st.button("Start Scraping", use_container_width=True, type="primary", key="btn_manual"):
-                if not article_input or not format_input:
-                    st.error("Article Name and Format Name are required!")
+            if st.button("Start Scraping Grid Data", use_container_width=True, type="primary", key="btn_grid"):
+                # Clean up the dataframe (remove completely empty rows)
+                # Replace empty strings with NaN to drop them properly
+                clean_df = edited_df.replace(r'^\s*$', pd.NA, regex=True)
+                clean_df = clean_df.dropna(subset=["Article Name", "Format Name"], how="all")
+                
+                if clean_df.empty:
+                    st.error("Please paste or type at least one valid row with an Article Name and Format Name!")
                 else:
                     state.is_scraping = True
-                    df = pd.DataFrame([{
-                        "DOI": doi_input,
-                        "Article Name": article_input,
-                        "Format Name": format_input
-                    }])
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-                        df.to_excel(tmp.name, index=False)
+                        clean_df.to_excel(tmp.name, index=False)
                         tmp_path = tmp.name
 
-    # Trigger scraper engine if a file path was successfully prepared in either tab
+    # Trigger scraper engine
     if tmp_path and state.is_scraping:
         state.logs = []
         state.progress = 0.0
@@ -130,10 +142,8 @@ with col1:
         state.engine = engine
         state.output_dir = engine.output_dir
         
-        # Start the main scraper engine thread
         thread = threading.Thread(target=engine.run)
         thread.start()
-        
         st.rerun()
             
     if state.is_scraping:
